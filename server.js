@@ -36,7 +36,7 @@ function withTimeout(promise, ms, message) {
     }),
   ]);
 }
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "12mb" }));
 
 let isReady = false;
 let clientState = "initializing";
@@ -229,7 +229,7 @@ function validateMessage(message, hasImage) {
   const trimmed = String(message || "").trim();
 
   if (!trimmed && !hasImage) {
-    return { valid: false, message: "Message or image URL is required" };
+    return { valid: false, message: "Message or image is required" };
   }
 
   if (trimmed.length > 4096) {
@@ -249,7 +249,7 @@ app.get("/", (req, res) => {
       sendMessageGet:
         "GET /send-message?phone=919876543210&message=Hello&image=https://example.com/pic.jpg",
       sendMessagePost:
-        'POST /send-message {"phone","message","image"}',
+        'POST /send-message {phone, message, image | imageBase64, imageMime}',
       health: "GET /health",
     },
   });
@@ -305,7 +305,87 @@ app.get("/health", (req, res) => {
   });
 });
 
-async function handleSendMessage(phone, message, imageUrl, res) {
+const ALLOWED_IMAGE_MIMES = [
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+];
+
+function parseImageOptions(source) {
+  const url = source.image || source.imageUrl || null;
+  const imageCheck = validateImageUrl(url);
+  if (!imageCheck.valid) {
+    return imageCheck;
+  }
+
+  let base64 = source.imageBase64 || source.image_base64 || null;
+  let mime = source.imageMime || source.imageMimetype || source.mimeType || null;
+  let filename = source.imageFilename || source.filename || "image.jpg";
+
+  if (base64 && typeof base64 === "string") {
+    base64 = base64.trim();
+    if (base64.includes("base64,")) {
+      const header = base64.split(";base64,")[0];
+      if (header.startsWith("data:")) {
+        mime = mime || header.replace("data:", "");
+      }
+      base64 = base64.split("base64,")[1];
+    }
+
+    if (!mime || !ALLOWED_IMAGE_MIMES.includes(mime)) {
+      return {
+        valid: false,
+        message: "imageMime must be image/jpeg, image/png, image/gif, or image/webp",
+      };
+    }
+
+    if (base64.length > 10 * 1024 * 1024) {
+      return { valid: false, message: "Image file is too large (max ~7MB)" };
+    }
+
+    return {
+      valid: true,
+      url: imageCheck.url,
+      base64,
+      mime,
+      filename,
+    };
+  }
+
+  return {
+    valid: true,
+    url: imageCheck.url,
+    base64: null,
+    mime: null,
+    filename: null,
+  };
+}
+
+async function buildMessageMedia(imageOptions) {
+  if (imageOptions.base64) {
+    return new MessageMedia(
+      imageOptions.mime,
+      imageOptions.base64,
+      imageOptions.filename
+    );
+  }
+
+  if (imageOptions.url) {
+    return withTimeout(
+      MessageMedia.fromUrl(imageOptions.url, {
+        unsafeMime: true,
+        client,
+      }),
+      60000,
+      "Failed to download image from URL"
+    );
+  }
+
+  return null;
+}
+
+async function handleSendMessage(phone, message, imageSource, res) {
   if (!isReady) {
     return res.status(503).json({
       status: false,
@@ -322,15 +402,21 @@ async function handleSendMessage(phone, message, imageUrl, res) {
     });
   }
 
-  const imageCheck = validateImageUrl(imageUrl);
-  if (!imageCheck.valid) {
+  const imageOptions = parseImageOptions(
+    typeof imageSource === "string"
+      ? { image: imageSource }
+      : imageSource || {}
+  );
+
+  if (!imageOptions.valid) {
     return res.status(400).json({
       status: false,
-      message: imageCheck.message,
+      message: imageOptions.message,
     });
   }
 
-  const messageCheck = validateMessage(message, Boolean(imageCheck.url));
+  const hasImage = Boolean(imageOptions.url || imageOptions.base64);
+  const messageCheck = validateMessage(message, hasImage);
   if (!messageCheck.valid) {
     return res.status(400).json({
       status: false,
@@ -338,7 +424,7 @@ async function handleSendMessage(phone, message, imageUrl, res) {
     });
   }
 
-  const sendTimeoutMs = imageCheck.url ? 120000 : 90000;
+  const sendTimeoutMs = hasImage ? 120000 : 90000;
 
   return enqueueWaTask(async () => {
     if (!isReady) {
@@ -350,17 +436,10 @@ async function handleSendMessage(phone, message, imageUrl, res) {
     }
 
     const chatId = await resolveChatId(phoneCheck.digits);
-    console.log("Sending to chatId:", chatId, imageCheck.url ? "(with image)" : "");
+    console.log("Sending to chatId:", chatId, hasImage ? "(with image)" : "");
 
-    if (imageCheck.url) {
-      const media = await withTimeout(
-        MessageMedia.fromUrl(imageCheck.url, {
-          unsafeMime: true,
-          client,
-        }),
-        60000,
-        "Failed to download image from URL"
-      );
+    if (hasImage) {
+      const media = await buildMessageMedia(imageOptions);
 
       await withTimeout(
         client.sendMessage(chatId, media, {
@@ -384,14 +463,12 @@ async function handleSendMessage(phone, message, imageUrl, res) {
 
     console.log("Message sent", {
       to: phoneCheck.digits,
-      image: Boolean(imageCheck.url),
+      image: hasImage,
     });
 
     return res.json({
       status: true,
-      message: imageCheck.url
-        ? "Image sent successfully"
-        : "Message sent successfully",
+      message: hasImage ? "Image sent successfully" : "Message sent successfully",
     });
   });
 }
@@ -399,8 +476,7 @@ async function handleSendMessage(phone, message, imageUrl, res) {
 app.get("/send-message", async (req, res) => {
   try {
     const { phone, message, image, imageUrl } = req.query;
-    const imageParam = image || imageUrl;
-    await handleSendMessage(phone, message, imageParam, res);
+    await handleSendMessage(phone, message, { image: image || imageUrl }, res);
   } catch (error) {
     console.error("Send message error:", error.message);
     if (!res.headersSent) {
@@ -421,9 +497,16 @@ app.post("/send-message", async (req, res) => {
       });
     }
 
-    const { phone, message, image, imageUrl } = req.body;
-    const imageParam = image || imageUrl;
-    await handleSendMessage(phone, message, imageParam, res);
+    const {
+      phone,
+      message,
+      image,
+      imageUrl,
+      imageBase64,
+      imageMime,
+      imageFilename,
+    } = req.body;
+    await handleSendMessage(phone, message, req.body, res);
   } catch (error) {
     console.error("Send message error:", error.message);
     if (!res.headersSent) {

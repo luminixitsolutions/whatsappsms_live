@@ -88,6 +88,17 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
             border-radius: 8px;
             display: none;
         }
+        input[type="file"] {
+            width: 100%;
+            font-size: 0.875rem;
+            padding: 0.35rem 0;
+        }
+        .or-divider {
+            text-align: center;
+            font-size: 0.75rem;
+            color: var(--muted);
+            margin: 0.5rem 0;
+        }
         input:focus, textarea:focus {
             outline: none;
             border-color: var(--primary);
@@ -146,9 +157,12 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
                 <textarea id="message" name="message" placeholder="Type your message..."></textarea>
             </div>
             <div class="form-group">
-                <label for="image">Image URL <span style="font-weight:400;color:var(--muted)">(optional)</span></label>
+                <label for="imageFile">Choose image <span style="font-weight:400;color:var(--muted)">(optional)</span></label>
+                <input type="file" id="imageFile" name="imageFile" accept="image/jpeg,image/png,image/gif,image/webp">
+                <p class="hint">JPG, PNG, GIF, WebP - max 5MB. Message text becomes caption.</p>
+                <p class="or-divider">- or use image URL -</p>
+                <label for="image" style="margin-top:0.5rem">Image URL</label>
                 <input type="url" id="image" name="image" placeholder="https://example.com/photo.jpg">
-                <p class="hint">Direct link to JPG, PNG, or GIF. Message text becomes image caption.</p>
                 <img id="imagePreview" alt="Preview">
             </div>
             <button type="submit" class="btn" id="submitBtn">
@@ -190,22 +204,79 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
 
         var REQUEST_TIMEOUT_MS = 120000;
 
-        document.getElementById('image').addEventListener('input', function () {
-            var preview = document.getElementById('imagePreview');
+        var selectedFile = null;
+        var preview = document.getElementById('imagePreview');
+        var imageUrlInput = document.getElementById('image');
+        var imageFileInput = document.getElementById('imageFile');
+
+        function showPreview(src) {
+            preview.src = src;
+            preview.style.display = 'block';
+            preview.onerror = function () { preview.style.display = 'none'; };
+        }
+
+        imageUrlInput.addEventListener('input', function () {
+            selectedFile = null;
+            imageFileInput.value = '';
             var url = this.value.trim();
             if (!url) {
                 preview.style.display = 'none';
                 preview.removeAttribute('src');
                 return;
             }
-            preview.src = url;
-            preview.style.display = 'block';
-            preview.onerror = function () { preview.style.display = 'none'; };
+            showPreview(url);
         });
 
-        function buildPayload(phone, message, imageUrl) {
+        imageFileInput.addEventListener('change', function () {
+            imageUrlInput.value = '';
+            selectedFile = this.files && this.files[0] ? this.files[0] : null;
+            if (!selectedFile) {
+                preview.style.display = 'none';
+                preview.removeAttribute('src');
+                return;
+            }
+            var allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+            if (allowed.indexOf(selectedFile.type) === -1) {
+                showAlert('error', 'Please choose JPG, PNG, GIF, or WebP.');
+                this.value = '';
+                selectedFile = null;
+                return;
+            }
+            if (selectedFile.size > 5 * 1024 * 1024) {
+                showAlert('error', 'Image must be 5MB or smaller.');
+                this.value = '';
+                selectedFile = null;
+                return;
+            }
+            showPreview(URL.createObjectURL(selectedFile));
+        });
+
+        function readImageFile(file) {
+            return new Promise(function (resolve, reject) {
+                var reader = new FileReader();
+                reader.onload = function () {
+                    var result = reader.result;
+                    var base64 = result.split('base64,')[1];
+                    resolve({
+                        imageBase64: base64,
+                        imageMime: file.type,
+                        imageFilename: file.name
+                    });
+                };
+                reader.onerror = function () { reject(new Error('Could not read image file.')); };
+                reader.readAsDataURL(file);
+            });
+        }
+
+        function buildPayload(phone, message, imageUrl, fileData) {
             var payload = { phone: phone, message: message };
-            if (imageUrl) payload.image = imageUrl;
+            if (fileData) {
+                payload.imageBase64 = fileData.imageBase64;
+                payload.imageMime = fileData.imageMime;
+                payload.imageFilename = fileData.imageFilename;
+            } else if (imageUrl) {
+                payload.image = imageUrl;
+            }
             return payload;
         }
 
@@ -241,12 +312,12 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
             return fetchWithTimeout(url, { method: 'GET', mode: 'cors' }).then(parseApiResponse);
         }
 
-        function sendPost(phone, message, imageUrl) {
+        function sendPost(phone, message, imageUrl, fileData) {
             return fetchWithTimeout(API_URL, {
                 method: 'POST',
                 mode: 'cors',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(buildPayload(phone, message, imageUrl))
+                body: JSON.stringify(buildPayload(phone, message, imageUrl, fileData))
             }).then(parseApiResponse);
         }
 
@@ -256,10 +327,16 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
             if (!phoneCheck.ok) { showAlert('error', phoneCheck.error); return; }
 
             var messageRaw = document.getElementById('message').value.trim();
-            var imageRaw = document.getElementById('image').value.trim();
+            var imageRaw = imageUrlInput.value.trim();
+            var hasFile = Boolean(selectedFile);
 
-            if (!messageRaw && !imageRaw) {
-                showAlert('error', 'Enter a message and/or image URL.');
+            if (!messageRaw && !imageRaw && !hasFile) {
+                showAlert('error', 'Enter a message and/or choose an image.');
+                return;
+            }
+
+            if (imageRaw && hasFile) {
+                showAlert('error', 'Use either choose image OR image URL, not both.');
                 return;
             }
 
@@ -278,7 +355,7 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
 
             btn.disabled = true;
             btn.classList.add('is-loading');
-            btnText.textContent = imageRaw ? 'Sending image...' : 'Sending...';
+            btnText.textContent = (imageRaw || hasFile) ? 'Sending image...' : 'Sending...';
             alertBox.style.display = 'none';
 
             var safetyTimer = setTimeout(function () {
@@ -286,10 +363,16 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
                 showAlert('error', 'Request timed out. Try again or open the API status link below.');
             }, REQUEST_TIMEOUT_MS + 3000);
 
-            sendPost(phoneCheck.phone, messageRaw, imageRaw || null)
-                .catch(function () {
-                    return sendGet(phoneCheck.phone, messageRaw, imageRaw || null);
+            var sendPromise = hasFile
+                ? readImageFile(selectedFile).then(function (fileData) {
+                    return sendPost(phoneCheck.phone, messageRaw, null, fileData);
                 })
+                : sendPost(phoneCheck.phone, messageRaw, imageRaw || null, null)
+                    .catch(function () {
+                        return sendGet(phoneCheck.phone, messageRaw, imageRaw || null);
+                    });
+
+            sendPromise
                 .then(function (result) {
                     if (!result) {
                         showAlert('error', 'Cannot reach Railway API. Check status link below.');
@@ -298,13 +381,17 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
                     if (result.data && result.data.status === true) {
                         showAlert('success', result.data.message || 'Message sent successfully');
                         form.reset();
+                        selectedFile = null;
+                        preview.style.display = 'none';
                         return;
                     }
                     showAlert('error', (result.data && result.data.message) || result.body || 'Failed to send message.');
                 })
                 .catch(function (err) {
                     if (err && err.name === 'AbortError') {
-                        showAlert('error', 'Request timed out. WhatsApp may be slow — try again.');
+                        showAlert('error', 'Request timed out. WhatsApp may be slow - try again.');
+                    } else if (err && err.message) {
+                        showAlert('error', err.message);
                     } else {
                         showAlert('error', 'Network error. Check API status is ready, then try again.');
                     }
