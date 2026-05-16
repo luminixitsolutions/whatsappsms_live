@@ -172,6 +172,8 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
         </form>
 
         <p class="footer-note">
+            Wait 3+ seconds between messages.
+            <br>
             <a href="<?php echo htmlspecialchars(WHATSAPP_API_BASE, ENT_QUOTES, 'UTF-8'); ?>/status" target="_blank" rel="noopener">Check API status</a>
             ·
             <a href="<?php echo htmlspecialchars(WHATSAPP_API_BASE, ENT_QUOTES, 'UTF-8'); ?>/qr" target="_blank" rel="noopener">QR login</a>
@@ -202,7 +204,10 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
             return { ok: true, phone: digits };
         }
 
-        var REQUEST_TIMEOUT_MS = 120000;
+        var TEXT_TIMEOUT_MS = 55000;
+        var IMAGE_TIMEOUT_MS = 125000;
+        var lastSubmitAt = 0;
+        var MIN_GAP_MS = 3000;
 
         var selectedFile = null;
         var preview = document.getElementById('imagePreview');
@@ -286,11 +291,11 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
             btnText.textContent = 'Send Message';
         }
 
-        function fetchWithTimeout(url, options) {
+        function fetchWithTimeout(url, options, timeoutMs) {
             var controller = new AbortController();
             var timer = setTimeout(function () {
                 controller.abort();
-            }, REQUEST_TIMEOUT_MS);
+            }, timeoutMs);
 
             return fetch(url, Object.assign({}, options, { signal: controller.signal }))
                 .finally(function () {
@@ -306,23 +311,31 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
             });
         }
 
-        function sendGet(phone, message, imageUrl) {
+        function sendGet(phone, message, imageUrl, timeoutMs) {
             var url = API_URL + '?phone=' + encodeURIComponent(phone) + '&message=' + encodeURIComponent(message);
             if (imageUrl) url += '&image=' + encodeURIComponent(imageUrl);
-            return fetchWithTimeout(url, { method: 'GET', mode: 'cors' }).then(parseApiResponse);
+            return fetchWithTimeout(url, { method: 'GET', mode: 'cors' }, timeoutMs).then(parseApiResponse);
         }
 
-        function sendPost(phone, message, imageUrl, fileData) {
+        function sendPost(phone, message, imageUrl, fileData, timeoutMs) {
             return fetchWithTimeout(API_URL, {
                 method: 'POST',
                 mode: 'cors',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(buildPayload(phone, message, imageUrl, fileData))
-            }).then(parseApiResponse);
+            }, timeoutMs).then(parseApiResponse);
         }
 
         form.addEventListener('submit', function (e) {
             e.preventDefault();
+
+            var now = Date.now();
+            if (now - lastSubmitAt < MIN_GAP_MS) {
+                var waitSec = Math.ceil((MIN_GAP_MS - (now - lastSubmitAt)) / 1000);
+                showAlert('error', 'Please wait ' + waitSec + ' second(s) before sending again.');
+                return;
+            }
+
             var phoneCheck = normalizePhone(document.getElementById('phone').value);
             if (!phoneCheck.ok) { showAlert('error', phoneCheck.error); return; }
 
@@ -353,24 +366,30 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
                 }
             }
 
+            lastSubmitAt = now;
+            var hasImage = Boolean(imageRaw || hasFile);
+            var timeoutMs = hasImage ? IMAGE_TIMEOUT_MS : TEXT_TIMEOUT_MS;
+
             btn.disabled = true;
             btn.classList.add('is-loading');
-            btnText.textContent = (imageRaw || hasFile) ? 'Sending image...' : 'Sending...';
+            btnText.textContent = hasImage ? 'Sending image...' : 'Sending...';
             alertBox.style.display = 'none';
 
             var safetyTimer = setTimeout(function () {
                 resetButton();
-                showAlert('error', 'Request timed out. Try again or open the API status link below.');
-            }, REQUEST_TIMEOUT_MS + 3000);
+                showAlert('error', 'Request timed out. Wait 5 seconds, then try again.');
+            }, timeoutMs + 2000);
 
-            var sendPromise = hasFile
-                ? readImageFile(selectedFile).then(function (fileData) {
-                    return sendPost(phoneCheck.phone, messageRaw, null, fileData);
-                })
-                : sendPost(phoneCheck.phone, messageRaw, imageRaw || null, null)
-                    .catch(function () {
-                        return sendGet(phoneCheck.phone, messageRaw, imageRaw || null);
-                    });
+            var sendPromise;
+            if (hasFile) {
+                sendPromise = readImageFile(selectedFile).then(function (fileData) {
+                    return sendPost(phoneCheck.phone, messageRaw, null, fileData, timeoutMs);
+                });
+            } else if (imageRaw) {
+                sendPromise = sendPost(phoneCheck.phone, messageRaw, imageRaw, null, timeoutMs);
+            } else {
+                sendPromise = sendGet(phoneCheck.phone, messageRaw, null, timeoutMs);
+            }
 
             sendPromise
                 .then(function (result) {
@@ -383,6 +402,7 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
                         form.reset();
                         selectedFile = null;
                         preview.style.display = 'none';
+                        lastSubmitAt = Date.now();
                         return;
                     }
                     showAlert('error', (result.data && result.data.message) || result.body || 'Failed to send message.');

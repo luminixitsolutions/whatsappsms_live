@@ -43,11 +43,37 @@ let clientState = "initializing";
 let lastQr = null;
 let isReconnecting = false;
 let waQueue = Promise.resolve();
+let waCooldownUntil = 0;
 const chatIdCache = new Map();
+const GAP_BETWEEN_SENDS_MS = 2500;
 
-function enqueueWaTask(task) {
-  const run = waQueue.then(task);
-  waQueue = run.catch(() => {});
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function enqueueWaTask(task, timeoutMs = 45000) {
+  const run = waQueue
+    .then(async () => {
+      const waitMs = waCooldownUntil - Date.now();
+      if (waitMs > 0) {
+        console.log(`WhatsApp cooldown ${waitMs}ms`);
+        await delay(waitMs);
+      }
+
+      await delay(GAP_BETWEEN_SENDS_MS);
+
+      return withTimeout(
+        Promise.resolve().then(task),
+        timeoutMs,
+        "WhatsApp busy — wait 5 seconds and try again."
+      );
+    })
+    .catch((error) => {
+      waCooldownUntil = Date.now() + 8000;
+      throw error;
+    });
+
+  waQueue = run.then(() => undefined).catch(() => undefined);
   return run;
 }
 
@@ -424,7 +450,8 @@ async function handleSendMessage(phone, message, imageSource, res) {
     });
   }
 
-  const sendTimeoutMs = hasImage ? 120000 : 90000;
+  const sendTimeoutMs = hasImage ? 90000 : 40000;
+  const queueTimeoutMs = hasImage ? 120000 : 55000;
 
   return enqueueWaTask(async () => {
     if (!isReady) {
@@ -470,7 +497,7 @@ async function handleSendMessage(phone, message, imageSource, res) {
       status: true,
       message: hasImage ? "Image sent successfully" : "Message sent successfully",
     });
-  });
+  }, queueTimeoutMs);
 }
 
 app.get("/send-message", async (req, res) => {
