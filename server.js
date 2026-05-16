@@ -4,7 +4,7 @@ const express = require("express");
 const cors = require("cors");
 const qrcode = require("qrcode-terminal");
 const QRCode = require("qrcode");
-const { Client, LocalAuth } = require("whatsapp-web.js");
+const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
 
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = "0.0.0.0";
@@ -193,15 +193,43 @@ function validatePhone(phone) {
   return { valid: true, digits };
 }
 
-function validateMessage(message) {
-  if (typeof message !== "string") {
+function validateImageUrl(imageUrl) {
+  if (imageUrl === undefined || imageUrl === null || imageUrl === "") {
+    return { valid: true, url: null };
+  }
+
+  if (typeof imageUrl !== "string") {
+    return { valid: false, message: "Image URL must be a string" };
+  }
+
+  const trimmed = imageUrl.trim();
+  if (!trimmed) {
+    return { valid: true, url: null };
+  }
+
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return {
+        valid: false,
+        message: "Image URL must start with http:// or https://",
+      };
+    }
+    return { valid: true, url: trimmed };
+  } catch (error) {
+    return { valid: false, message: "Invalid image URL" };
+  }
+}
+
+function validateMessage(message, hasImage) {
+  if (message !== undefined && message !== null && typeof message !== "string") {
     return { valid: false, message: "Message must be a string" };
   }
 
-  const trimmed = message.trim();
+  const trimmed = String(message || "").trim();
 
-  if (!trimmed) {
-    return { valid: false, message: "Message cannot be empty" };
+  if (!trimmed && !hasImage) {
+    return { valid: false, message: "Message or image URL is required" };
   }
 
   if (trimmed.length > 4096) {
@@ -219,8 +247,9 @@ app.get("/", (req, res) => {
       qr: "GET /qr",
       status: "GET /status",
       sendMessageGet:
-        "GET /send-message?phone=919876543210&message=Hello",
-      sendMessagePost: "POST /send-message",
+        "GET /send-message?phone=919876543210&message=Hello&image=https://example.com/pic.jpg",
+      sendMessagePost:
+        'POST /send-message {"phone","message","image"}',
       health: "GET /health",
     },
   });
@@ -276,7 +305,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-async function handleSendMessage(phone, message, res) {
+async function handleSendMessage(phone, message, imageUrl, res) {
   if (!isReady) {
     return res.status(503).json({
       status: false,
@@ -293,13 +322,23 @@ async function handleSendMessage(phone, message, res) {
     });
   }
 
-  const messageCheck = validateMessage(message);
+  const imageCheck = validateImageUrl(imageUrl);
+  if (!imageCheck.valid) {
+    return res.status(400).json({
+      status: false,
+      message: imageCheck.message,
+    });
+  }
+
+  const messageCheck = validateMessage(message, Boolean(imageCheck.url));
   if (!messageCheck.valid) {
     return res.status(400).json({
       status: false,
       message: messageCheck.message,
     });
   }
+
+  const sendTimeoutMs = imageCheck.url ? 120000 : 90000;
 
   return enqueueWaTask(async () => {
     if (!isReady) {
@@ -311,30 +350,57 @@ async function handleSendMessage(phone, message, res) {
     }
 
     const chatId = await resolveChatId(phoneCheck.digits);
-    console.log("Sending to chatId:", chatId);
+    console.log("Sending to chatId:", chatId, imageCheck.url ? "(with image)" : "");
 
-    await withTimeout(
-      client.sendMessage(chatId, messageCheck.text, {
-        linkPreview: false,
-        sendSeen: false,
-      }),
-      90000,
-      "WhatsApp send timed out — wait 10 seconds between messages and try again."
-    );
+    if (imageCheck.url) {
+      const media = await withTimeout(
+        MessageMedia.fromUrl(imageCheck.url, {
+          unsafeMime: true,
+          client,
+        }),
+        60000,
+        "Failed to download image from URL"
+      );
 
-    console.log("Message sent", { to: phoneCheck.digits });
+      await withTimeout(
+        client.sendMessage(chatId, media, {
+          caption: messageCheck.text || undefined,
+          linkPreview: false,
+          sendSeen: false,
+        }),
+        sendTimeoutMs,
+        "WhatsApp image send timed out — wait and try again."
+      );
+    } else {
+      await withTimeout(
+        client.sendMessage(chatId, messageCheck.text, {
+          linkPreview: false,
+          sendSeen: false,
+        }),
+        sendTimeoutMs,
+        "WhatsApp send timed out — wait 10 seconds between messages and try again."
+      );
+    }
+
+    console.log("Message sent", {
+      to: phoneCheck.digits,
+      image: Boolean(imageCheck.url),
+    });
 
     return res.json({
       status: true,
-      message: "Message sent successfully",
+      message: imageCheck.url
+        ? "Image sent successfully"
+        : "Message sent successfully",
     });
   });
 }
 
 app.get("/send-message", async (req, res) => {
   try {
-    const { phone, message } = req.query;
-    await handleSendMessage(phone, message, res);
+    const { phone, message, image, imageUrl } = req.query;
+    const imageParam = image || imageUrl;
+    await handleSendMessage(phone, message, imageParam, res);
   } catch (error) {
     console.error("Send message error:", error.message);
     if (!res.headersSent) {
@@ -355,8 +421,9 @@ app.post("/send-message", async (req, res) => {
       });
     }
 
-    const { phone, message } = req.body;
-    await handleSendMessage(phone, message, res);
+    const { phone, message, image, imageUrl } = req.body;
+    const imageParam = image || imageUrl;
+    await handleSendMessage(phone, message, imageParam, res);
   } catch (error) {
     console.error("Send message error:", error.message);
     if (!res.headersSent) {

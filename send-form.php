@@ -73,13 +73,20 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
         .form-group { margin-bottom: 1.25rem; }
         label { display: block; font-size: 0.875rem; font-weight: 600; margin-bottom: 0.4rem; }
         .hint { font-size: 0.75rem; color: var(--muted); margin-top: 0.35rem; }
-        input[type="text"], textarea {
+        input[type="text"], input[type="url"], textarea {
             width: 100%;
             padding: 0.75rem 1rem;
             border: 1px solid var(--border);
             border-radius: 10px;
             font-size: 1rem;
             font-family: inherit;
+        }
+        #imagePreview {
+            margin-top: 0.5rem;
+            max-width: 100%;
+            max-height: 160px;
+            border-radius: 8px;
+            display: none;
         }
         input:focus, textarea:focus {
             outline: none;
@@ -135,8 +142,14 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
                 <p class="hint">Country code + number (e.g. 919876543210). + and spaces are OK.</p>
             </div>
             <div class="form-group">
-                <label for="message">Message</label>
-                <textarea id="message" name="message" placeholder="Type your message..." required></textarea>
+                <label for="message">Message <span style="font-weight:400;color:var(--muted)">(caption if image)</span></label>
+                <textarea id="message" name="message" placeholder="Type your message..."></textarea>
+            </div>
+            <div class="form-group">
+                <label for="image">Image URL <span style="font-weight:400;color:var(--muted)">(optional)</span></label>
+                <input type="url" id="image" name="image" placeholder="https://example.com/photo.jpg">
+                <p class="hint">Direct link to JPG, PNG, or GIF. Message text becomes image caption.</p>
+                <img id="imagePreview" alt="Preview">
             </div>
             <button type="submit" class="btn" id="submitBtn">
                 <span class="spinner" aria-hidden="true"></span>
@@ -175,7 +188,26 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
             return { ok: true, phone: digits };
         }
 
-        var REQUEST_TIMEOUT_MS = 65000;
+        var REQUEST_TIMEOUT_MS = 120000;
+
+        document.getElementById('image').addEventListener('input', function () {
+            var preview = document.getElementById('imagePreview');
+            var url = this.value.trim();
+            if (!url) {
+                preview.style.display = 'none';
+                preview.removeAttribute('src');
+                return;
+            }
+            preview.src = url;
+            preview.style.display = 'block';
+            preview.onerror = function () { preview.style.display = 'none'; };
+        });
+
+        function buildPayload(phone, message, imageUrl) {
+            var payload = { phone: phone, message: message };
+            if (imageUrl) payload.image = imageUrl;
+            return payload;
+        }
 
         function resetButton() {
             btn.disabled = false;
@@ -203,17 +235,18 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
             });
         }
 
-        function sendGet(phone, message) {
+        function sendGet(phone, message, imageUrl) {
             var url = API_URL + '?phone=' + encodeURIComponent(phone) + '&message=' + encodeURIComponent(message);
+            if (imageUrl) url += '&image=' + encodeURIComponent(imageUrl);
             return fetchWithTimeout(url, { method: 'GET', mode: 'cors' }).then(parseApiResponse);
         }
 
-        function sendPost(phone, message) {
+        function sendPost(phone, message, imageUrl) {
             return fetchWithTimeout(API_URL, {
                 method: 'POST',
                 mode: 'cors',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ phone: phone, message: message })
+                body: JSON.stringify(buildPayload(phone, message, imageUrl))
             }).then(parseApiResponse);
         }
 
@@ -223,11 +256,29 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
             if (!phoneCheck.ok) { showAlert('error', phoneCheck.error); return; }
 
             var messageRaw = document.getElementById('message').value.trim();
-            if (!messageRaw) { showAlert('error', 'Message is required.'); return; }
+            var imageRaw = document.getElementById('image').value.trim();
+
+            if (!messageRaw && !imageRaw) {
+                showAlert('error', 'Enter a message and/or image URL.');
+                return;
+            }
+
+            if (imageRaw) {
+                try {
+                    var imgUrl = new URL(imageRaw);
+                    if (imgUrl.protocol !== 'http:' && imgUrl.protocol !== 'https:') {
+                        showAlert('error', 'Image URL must start with http:// or https://');
+                        return;
+                    }
+                } catch (err) {
+                    showAlert('error', 'Invalid image URL.');
+                    return;
+                }
+            }
 
             btn.disabled = true;
             btn.classList.add('is-loading');
-            btnText.textContent = 'Sending...';
+            btnText.textContent = imageRaw ? 'Sending image...' : 'Sending...';
             alertBox.style.display = 'none';
 
             var safetyTimer = setTimeout(function () {
@@ -235,9 +286,9 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
                 showAlert('error', 'Request timed out. Try again or open the API status link below.');
             }, REQUEST_TIMEOUT_MS + 3000);
 
-            sendGet(phoneCheck.phone, messageRaw)
+            sendPost(phoneCheck.phone, messageRaw, imageRaw || null)
                 .catch(function () {
-                    return sendPost(phoneCheck.phone, messageRaw);
+                    return sendGet(phoneCheck.phone, messageRaw, imageRaw || null);
                 })
                 .then(function (result) {
                     if (!result) {
