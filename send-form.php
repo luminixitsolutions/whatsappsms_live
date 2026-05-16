@@ -3,11 +3,14 @@
  * WhatsApp message form — integrates with Node.js WhatsApp API.
  * Compatible with PHP 7+, Laragon, XAMPP, and live servers.
  *
- * Set WHATSAPP_API_URL to match your Node server (default port 3000).
+ * Production API: Railway. Override with WHATSAPP_API_URL env for local dev.
  */
 
-// --- Configuration (adjust for production) ---
-define('WHATSAPP_API_URL', getenv('WHATSAPP_API_URL') ?: 'http://localhost:3000/send-message');
+// --- Configuration ---
+define(
+    'WHATSAPP_API_URL',
+    getenv('WHATSAPP_API_URL') ?: 'https://whatsappsmslive-production.up.railway.app/send-message'
+);
 define('CURL_TIMEOUT', 30);
 
 /**
