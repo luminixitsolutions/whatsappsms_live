@@ -19,7 +19,27 @@ function ensureAuthDirectories() {
 ensureAuthDirectories();
 
 const app = express();
-app.use(cors());
+
+const allowedOrigins = [
+  "https://luminixprojects.in",
+  "http://luminixprojects.in",
+  "https://www.luminixprojects.in",
+  "http://www.luminixprojects.in",
+  "http://localhost",
+  "http://127.0.0.1",
+];
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      return callback(null, true);
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+  })
+);
 app.use(express.json({ limit: "1mb" }));
 
 let isReady = false;
