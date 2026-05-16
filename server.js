@@ -41,23 +41,84 @@ app.use(express.json({ limit: "1mb" }));
 let isReady = false;
 let clientState = "initializing";
 let lastQr = null;
+let isReconnecting = false;
+
+const puppeteerExecutable =
+  process.env.PUPPETEER_EXECUTABLE_PATH ||
+  process.env.CHROME_PATH ||
+  undefined;
 
 const client = new Client({
   authStrategy: new LocalAuth({
     dataPath: AUTH_PATH,
     clientId: "default",
   }),
+  takeoverOnConflict: true,
+  takeoverTimeoutMs: 15000,
+  webVersionCache: {
+    type: "remote",
+    remotePath:
+      "https://raw.githubusercontent.com/wa-version/whatsapp-web-versions/main/html/{version}.html",
+  },
   puppeteer: {
     headless: true,
+    executablePath: puppeteerExecutable,
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
       "--disable-gpu",
       "--disable-software-rasterizer",
+      "--disable-extensions",
+      "--no-first-run",
     ],
   },
 });
+
+async function getWaState() {
+  try {
+    return await client.getState();
+  } catch (error) {
+    return null;
+  }
+}
+
+async function ensureConnected() {
+  const state = await withTimeout(
+    getWaState(),
+    15000,
+    "WhatsApp state check timed out"
+  );
+  if (state !== "CONNECTED") {
+    isReady = false;
+    throw new Error(
+      `WhatsApp not connected (state: ${state || "unknown"}). Re-scan QR at /qr`
+    );
+  }
+  return state;
+}
+
+async function resolveChatId(digits) {
+  const numberId = await withTimeout(
+    client.getNumberId(digits),
+    30000,
+    "Number lookup timed out — WhatsApp browser may be stuck. Try /qr again."
+  );
+
+  if (!numberId) {
+    throw new Error("This number is not registered on WhatsApp.");
+  }
+
+  if (numberId._serialized) {
+    return numberId._serialized;
+  }
+
+  if (numberId.user) {
+    return `${numberId.user}@c.us`;
+  }
+
+  return `${digits}@c.us`;
+}
 
 client.on("qr", (qr) => {
   lastQr = qr;
@@ -86,10 +147,34 @@ client.on("ready", () => {
   console.log("WhatsApp ready");
 });
 
-client.on("disconnected", (reason) => {
+client.on("disconnected", async (reason) => {
   isReady = false;
   clientState = "disconnected";
   console.log("Disconnected", reason ? `(${reason})` : "");
+
+  if (isReconnecting) {
+    return;
+  }
+
+  isReconnecting = true;
+  console.log("Reconnecting WhatsApp client in 5s...");
+
+  setTimeout(async () => {
+    try {
+      await client.destroy();
+    } catch (error) {
+      console.error("Destroy before reconnect:", error.message);
+    }
+
+    try {
+      await client.initialize();
+      console.log("WhatsApp reconnect started");
+    } catch (error) {
+      console.error("Reconnect failed:", error.message);
+    } finally {
+      isReconnecting = false;
+    }
+  }, 5000);
 });
 
 client.on("loading_screen", (percent, message) => {
@@ -186,9 +271,18 @@ app.get("/qr", async (req, res) => {
   }
 });
 
-app.get("/status", (req, res) => {
+app.get("/status", async (req, res) => {
+  const waState = isReady ? await getWaState() : clientState;
+  const connected = waState === "CONNECTED";
+
+  if (isReady && !connected) {
+    isReady = false;
+    clientState = waState || "not_connected";
+  }
+
   res.json({
-    status: isReady ? "ready" : "not_ready",
+    status: connected ? "ready" : "not_ready",
+    waState: waState || clientState,
   });
 });
 
@@ -225,11 +319,18 @@ async function handleSendMessage(phone, message, res) {
     });
   }
 
-  const chatId = `${phoneCheck.digits}@c.us`;
+  await ensureConnected();
+
+  const chatId = await resolveChatId(phoneCheck.digits);
+  console.log("Sending to chatId:", chatId);
+
   await withTimeout(
-    client.sendMessage(chatId, messageCheck.text),
-    60000,
-    "WhatsApp send timed out after 60s"
+    client.sendMessage(chatId, messageCheck.text, {
+      linkPreview: false,
+      sendSeen: false,
+    }),
+    90000,
+    "WhatsApp send timed out after 90s — re-link at /qr or upgrade Railway memory (1GB+)"
   );
 
   console.log("Message sent", { to: phoneCheck.digits });
