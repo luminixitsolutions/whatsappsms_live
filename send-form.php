@@ -175,6 +175,26 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
             return { ok: true, phone: digits };
         }
 
+        var REQUEST_TIMEOUT_MS = 65000;
+
+        function resetButton() {
+            btn.disabled = false;
+            btn.classList.remove('is-loading');
+            btnText.textContent = 'Send Message';
+        }
+
+        function fetchWithTimeout(url, options) {
+            var controller = new AbortController();
+            var timer = setTimeout(function () {
+                controller.abort();
+            }, REQUEST_TIMEOUT_MS);
+
+            return fetch(url, Object.assign({}, options, { signal: controller.signal }))
+                .finally(function () {
+                    clearTimeout(timer);
+                });
+        }
+
         function parseApiResponse(res) {
             return res.text().then(function (body) {
                 var data;
@@ -183,18 +203,18 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
             });
         }
 
-        function sendPost(phone, message) {
-            return fetch(API_URL, {
-                method: 'POST',
-                mode: 'cors',
-                headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-                body: JSON.stringify({ phone: phone, message: message })
-            }).then(parseApiResponse);
-        }
-
         function sendGet(phone, message) {
             var url = API_URL + '?phone=' + encodeURIComponent(phone) + '&message=' + encodeURIComponent(message);
-            return fetch(url, { method: 'GET', mode: 'cors', headers: { Accept: 'application/json' } }).then(parseApiResponse);
+            return fetchWithTimeout(url, { method: 'GET', mode: 'cors' }).then(parseApiResponse);
+        }
+
+        function sendPost(phone, message) {
+            return fetchWithTimeout(API_URL, {
+                method: 'POST',
+                mode: 'cors',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ phone: phone, message: message })
+            }).then(parseApiResponse);
         }
 
         form.addEventListener('submit', function (e) {
@@ -210,8 +230,15 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
             btnText.textContent = 'Sending...';
             alertBox.style.display = 'none';
 
-            sendPost(phoneCheck.phone, messageRaw)
-                .catch(function () { return sendGet(phoneCheck.phone, messageRaw); })
+            var safetyTimer = setTimeout(function () {
+                resetButton();
+                showAlert('error', 'Request timed out. Try again or open the API status link below.');
+            }, REQUEST_TIMEOUT_MS + 3000);
+
+            sendGet(phoneCheck.phone, messageRaw)
+                .catch(function () {
+                    return sendPost(phoneCheck.phone, messageRaw);
+                })
                 .then(function (result) {
                     if (!result) {
                         showAlert('error', 'Cannot reach Railway API. Check status link below.');
@@ -224,13 +251,16 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
                     }
                     showAlert('error', (result.data && result.data.message) || result.body || 'Failed to send message.');
                 })
-                .catch(function () {
-                    showAlert('error', 'Network error. Ensure API status is ready, then try again.');
+                .catch(function (err) {
+                    if (err && err.name === 'AbortError') {
+                        showAlert('error', 'Request timed out. WhatsApp may be slow — try again.');
+                    } else {
+                        showAlert('error', 'Network error. Check API status is ready, then try again.');
+                    }
                 })
                 .finally(function () {
-                    btn.disabled = false;
-                    btn.classList.remove('is-loading');
-                    btnText.textContent = 'Send Message';
+                    clearTimeout(safetyTimer);
+                    resetButton();
                 });
         });
     })();

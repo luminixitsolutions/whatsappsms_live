@@ -20,26 +20,22 @@ ensureAuthDirectories();
 
 const app = express();
 
-const allowedOrigins = [
-  "https://luminixprojects.in",
-  "http://luminixprojects.in",
-  "https://www.luminixprojects.in",
-  "http://www.luminixprojects.in",
-  "http://localhost",
-  "http://127.0.0.1",
-];
-
 app.use(
   cors({
-    origin(origin, callback) {
-      if (!origin || allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
-      return callback(null, true);
-    },
+    origin: true,
     methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Accept"],
   })
 );
+
+function withTimeout(promise, ms, message) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error(message || "Request timed out")), ms);
+    }),
+  ]);
+}
 app.use(express.json({ limit: "1mb" }));
 
 let isReady = false;
@@ -230,7 +226,11 @@ async function handleSendMessage(phone, message, res) {
   }
 
   const chatId = `${phoneCheck.digits}@c.us`;
-  await client.sendMessage(chatId, messageCheck.text);
+  await withTimeout(
+    client.sendMessage(chatId, messageCheck.text),
+    60000,
+    "WhatsApp send timed out after 60s"
+  );
 
   console.log("Message sent", { to: phoneCheck.digits });
 
