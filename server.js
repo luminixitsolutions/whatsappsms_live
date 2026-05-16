@@ -3,10 +3,11 @@ const path = require("path");
 const express = require("express");
 const cors = require("cors");
 const qrcode = require("qrcode-terminal");
+const QRCode = require("qrcode");
 const { Client, LocalAuth } = require("whatsapp-web.js");
 
 const PORT = Number(process.env.PORT) || 3000;
-const HOST = process.env.HOST || "0.0.0.0";
+const HOST = "0.0.0.0";
 const AUTH_PATH = path.resolve(__dirname, ".wwebjs_auth");
 const SESSION_PATH = path.join(AUTH_PATH, "session");
 
@@ -23,6 +24,7 @@ app.use(express.json({ limit: "1mb" }));
 
 let isReady = false;
 let clientState = "initializing";
+let lastQr = null;
 
 const client = new Client({
   authStrategy: new LocalAuth({
@@ -35,14 +37,18 @@ const client = new Client({
       "--no-sandbox",
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--disable-software-rasterizer",
     ],
   },
 });
 
 client.on("qr", (qr) => {
+  lastQr = qr;
   clientState = "qr_pending";
   isReady = false;
   console.log("QR received — scan with WhatsApp (Linked Devices):");
+  console.log("Open /qr in browser to scan on Railway");
   qrcode.generate(qr, { small: true });
 });
 
@@ -60,6 +66,7 @@ client.on("auth_failure", (message) => {
 client.on("ready", () => {
   isReady = true;
   clientState = "ready";
+  lastQr = null;
   console.log("WhatsApp ready");
 });
 
@@ -118,6 +125,7 @@ app.get("/", (req, res) => {
     name: "WhatsApp API",
     whatsapp: isReady ? "ready" : "not_ready",
     endpoints: {
+      qr: "GET /qr",
       status: "GET /status",
       sendMessageGet:
         "GET /send-message?phone=919876543210&message=Hello",
@@ -125,6 +133,41 @@ app.get("/", (req, res) => {
       health: "GET /health",
     },
   });
+});
+
+app.get("/qr", async (req, res) => {
+  if (isReady) {
+    return res.send(
+      "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>WhatsApp</title></head>" +
+        "<body style=\"font-family:sans-serif;text-align:center;padding:2rem\">" +
+        "<h2>WhatsApp is connected</h2><p><a href=\"/status\">Check status</a></p></body></html>"
+    );
+  }
+
+  if (!lastQr) {
+    return res.send(
+      "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"3\">" +
+        "<title>Waiting for QR</title></head>" +
+        "<body style=\"font-family:sans-serif;text-align:center;padding:2rem\">" +
+        "<h2>Waiting for QR code...</h2><p>Page refreshes every 3 seconds.</p></body></html>"
+    );
+  }
+
+  try {
+    const dataUrl = await QRCode.toDataURL(lastQr);
+    return res.send(
+      "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"20\">" +
+        "<title>Scan WhatsApp QR</title></head>" +
+        "<body style=\"font-family:sans-serif;text-align:center;padding:2rem\">" +
+        "<h2>Scan with WhatsApp</h2>" +
+        "<p>Settings → Linked devices → Link a device</p>" +
+        "<img src=\"" + dataUrl + "\" alt=\"WhatsApp QR\" style=\"max-width:320px\">" +
+        "<p><small>Refreshes every 20s if QR expires</small></p></body></html>"
+    );
+  } catch (error) {
+    console.error("QR page error:", error.message);
+    return res.status(500).send("Failed to generate QR image");
+  }
 });
 
 app.get("/status", (req, res) => {
