@@ -42,6 +42,14 @@ let isReady = false;
 let clientState = "initializing";
 let lastQr = null;
 let isReconnecting = false;
+let waQueue = Promise.resolve();
+const chatIdCache = new Map();
+
+function enqueueWaTask(task) {
+  const run = waQueue.then(task);
+  waQueue = run.catch(() => {});
+  return run;
+}
 
 const puppeteerExecutable =
   process.env.PUPPETEER_EXECUTABLE_PATH ||
@@ -75,49 +83,30 @@ const client = new Client({
   },
 });
 
-async function getWaState() {
-  try {
-    return await client.getState();
-  } catch (error) {
-    return null;
-  }
-}
-
-async function ensureConnected() {
-  const state = await withTimeout(
-    getWaState(),
-    15000,
-    "WhatsApp state check timed out"
-  );
-  if (state !== "CONNECTED") {
-    isReady = false;
-    throw new Error(
-      `WhatsApp not connected (state: ${state || "unknown"}). Re-scan QR at /qr`
-    );
-  }
-  return state;
-}
-
 async function resolveChatId(digits) {
+  if (chatIdCache.has(digits)) {
+    return chatIdCache.get(digits);
+  }
+
   const numberId = await withTimeout(
     client.getNumberId(digits),
-    30000,
-    "Number lookup timed out — WhatsApp browser may be stuck. Try /qr again."
+    45000,
+    "Number lookup timed out — wait a few seconds and try again."
   );
 
   if (!numberId) {
     throw new Error("This number is not registered on WhatsApp.");
   }
 
+  let chatId = `${digits}@c.us`;
   if (numberId._serialized) {
-    return numberId._serialized;
+    chatId = numberId._serialized;
+  } else if (numberId.user) {
+    chatId = `${numberId.user}@c.us`;
   }
 
-  if (numberId.user) {
-    return `${numberId.user}@c.us`;
-  }
-
-  return `${digits}@c.us`;
+  chatIdCache.set(digits, chatId);
+  return chatId;
 }
 
 client.on("qr", (qr) => {
@@ -144,6 +133,7 @@ client.on("ready", () => {
   isReady = true;
   clientState = "ready";
   lastQr = null;
+  chatIdCache.clear();
   console.log("WhatsApp ready");
 });
 
@@ -271,18 +261,10 @@ app.get("/qr", async (req, res) => {
   }
 });
 
-app.get("/status", async (req, res) => {
-  const waState = isReady ? await getWaState() : clientState;
-  const connected = waState === "CONNECTED";
-
-  if (isReady && !connected) {
-    isReady = false;
-    clientState = waState || "not_connected";
-  }
-
+app.get("/status", (req, res) => {
   res.json({
-    status: connected ? "ready" : "not_ready",
-    waState: waState || clientState,
+    status: isReady ? "ready" : "not_ready",
+    clientState,
   });
 });
 
@@ -319,25 +301,33 @@ async function handleSendMessage(phone, message, res) {
     });
   }
 
-  await ensureConnected();
+  return enqueueWaTask(async () => {
+    if (!isReady) {
+      return res.status(503).json({
+        status: false,
+        message: "WhatsApp not ready. Scan QR at /qr",
+        clientState,
+      });
+    }
 
-  const chatId = await resolveChatId(phoneCheck.digits);
-  console.log("Sending to chatId:", chatId);
+    const chatId = await resolveChatId(phoneCheck.digits);
+    console.log("Sending to chatId:", chatId);
 
-  await withTimeout(
-    client.sendMessage(chatId, messageCheck.text, {
-      linkPreview: false,
-      sendSeen: false,
-    }),
-    90000,
-    "WhatsApp send timed out after 90s — re-link at /qr or upgrade Railway memory (1GB+)"
-  );
+    await withTimeout(
+      client.sendMessage(chatId, messageCheck.text, {
+        linkPreview: false,
+        sendSeen: false,
+      }),
+      90000,
+      "WhatsApp send timed out — wait 10 seconds between messages and try again."
+    );
 
-  console.log("Message sent", { to: phoneCheck.digits });
+    console.log("Message sent", { to: phoneCheck.digits });
 
-  return res.json({
-    status: true,
-    message: "Message sent successfully",
+    return res.json({
+      status: true,
+      message: "Message sent successfully",
+    });
   });
 }
 
@@ -347,10 +337,12 @@ app.get("/send-message", async (req, res) => {
     await handleSendMessage(phone, message, res);
   } catch (error) {
     console.error("Send message error:", error.message);
-    return res.status(500).json({
-      status: false,
-      message: error.message || "Failed to send message",
-    });
+    if (!res.headersSent) {
+      return res.status(500).json({
+        status: false,
+        message: error.message || "Failed to send message",
+      });
+    }
   }
 });
 
@@ -367,10 +359,12 @@ app.post("/send-message", async (req, res) => {
     await handleSendMessage(phone, message, res);
   } catch (error) {
     console.error("Send message error:", error.message);
-    return res.status(500).json({
-      status: false,
-      message: error.message || "Failed to send message",
-    });
+    if (!res.headersSent) {
+      return res.status(500).json({
+        status: false,
+        message: error.message || "Failed to send message",
+      });
+    }
   }
 });
 
