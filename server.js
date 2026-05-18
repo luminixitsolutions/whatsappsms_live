@@ -195,8 +195,40 @@ client.on("disconnected", async (reason) => {
 
 client.on("loading_screen", (percent, message) => {
   clientState = "loading";
+  isReady = false;
   console.log(`Loading: ${percent}% — ${message}`);
 });
+
+async function getWaConnectionState() {
+  try {
+    return await withTimeout(
+      client.getState(),
+      8000,
+      "Could not read WhatsApp connection state"
+    );
+  } catch (error) {
+    console.warn("getState failed:", error.message);
+    return null;
+  }
+}
+
+async function assertWhatsAppConnected() {
+  const state = await getWaConnectionState();
+  if (state === "CONNECTED") {
+    return;
+  }
+
+  isReady = false;
+  if (clientState === "ready") {
+    clientState = state ? `wa_${String(state).toLowerCase()}` : "not_connected";
+  }
+
+  throw new Error(
+    state === null
+      ? "WhatsApp is busy or reconnecting — wait a few seconds and try again."
+      : `WhatsApp is not connected (${state}). Open /qr if you need to link again.`
+  );
+}
 
 function validatePhone(phone) {
   if (typeof phone !== "string" && typeof phone !== "number") {
@@ -316,10 +348,15 @@ app.get("/qr", async (req, res) => {
   }
 });
 
-app.get("/status", (req, res) => {
+app.get("/status", async (req, res) => {
+  const waState = await getWaConnectionState();
+  const ready =
+    isReady && clientState === "ready" && waState === "CONNECTED";
+
   res.json({
-    status: isReady ? "ready" : "not_ready",
+    status: ready ? "ready" : "not_ready",
     clientState,
+    waState: waState || "unknown",
   });
 });
 
@@ -327,7 +364,8 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     uptime: process.uptime(),
-    whatsapp: isReady ? "ready" : clientState,
+    whatsapp:
+      isReady && clientState === "ready" ? "ready" : clientState,
   });
 });
 
@@ -412,10 +450,15 @@ async function buildMessageMedia(imageOptions) {
 }
 
 async function handleSendMessage(phone, message, imageSource, res) {
-  if (!isReady) {
+  if (!isReady || clientState !== "ready") {
+    const busyMessage =
+      clientState === "loading"
+        ? "WhatsApp is loading or reconnecting — wait until status is ready, then try again."
+        : "WhatsApp not ready. Scan QR first or wait for session restore.";
+
     return res.status(503).json({
       status: false,
-      message: "WhatsApp not ready. Scan QR first or wait for session restore.",
+      message: busyMessage,
       clientState,
     });
   }
@@ -450,11 +493,11 @@ async function handleSendMessage(phone, message, imageSource, res) {
     });
   }
 
-  const sendTimeoutMs = hasImage ? 90000 : 40000;
-  const queueTimeoutMs = hasImage ? 120000 : 55000;
+  const sendTimeoutMs = hasImage ? 90000 : 60000;
+  const queueTimeoutMs = hasImage ? 120000 : 75000;
 
   return enqueueWaTask(async () => {
-    if (!isReady) {
+    if (!isReady || clientState !== "ready") {
       return res.status(503).json({
         status: false,
         message: "WhatsApp not ready. Scan QR at /qr",
@@ -462,30 +505,43 @@ async function handleSendMessage(phone, message, imageSource, res) {
       });
     }
 
+    await assertWhatsAppConnected();
+
     const chatId = await resolveChatId(phoneCheck.digits);
     console.log("Sending to chatId:", chatId, hasImage ? "(with image)" : "");
 
-    if (hasImage) {
-      const media = await buildMessageMedia(imageOptions);
+    const sendOptions = {
+      linkPreview: false,
+      sendSeen: false,
+    };
 
-      await withTimeout(
-        client.sendMessage(chatId, media, {
+    async function doSend() {
+      if (hasImage) {
+        const media = await buildMessageMedia(imageOptions);
+        return client.sendMessage(chatId, media, {
+          ...sendOptions,
           caption: messageCheck.text || undefined,
-          linkPreview: false,
-          sendSeen: false,
-        }),
-        sendTimeoutMs,
-        "WhatsApp image send timed out — wait and try again."
-      );
-    } else {
+        });
+      }
+
+      return client.sendMessage(chatId, messageCheck.text, sendOptions);
+    }
+
+    try {
       await withTimeout(
-        client.sendMessage(chatId, messageCheck.text, {
-          linkPreview: false,
-          sendSeen: false,
-        }),
+        doSend(),
         sendTimeoutMs,
-        "WhatsApp send timed out — wait 10 seconds between messages and try again."
+        hasImage
+          ? "WhatsApp image send timed out — wait and try again."
+          : "WhatsApp send timed out — wait 10 seconds between messages and try again."
       );
+    } catch (error) {
+      if (String(error.message || "").includes("timed out")) {
+        isReady = false;
+        chatIdCache.delete(phoneCheck.digits);
+        console.error("Send timed out — marking client not ready");
+      }
+      throw error;
     }
 
     console.log("Message sent", {

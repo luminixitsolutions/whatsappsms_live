@@ -204,7 +204,7 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
             return { ok: true, phone: digits };
         }
 
-        var TEXT_TIMEOUT_MS = 55000;
+        var TEXT_TIMEOUT_MS = 80000;
         var IMAGE_TIMEOUT_MS = 125000;
         var lastSubmitAt = 0;
         var MIN_GAP_MS = 3000;
