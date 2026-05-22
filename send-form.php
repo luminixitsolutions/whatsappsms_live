@@ -99,6 +99,39 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
             color: var(--muted);
             margin: 0.5rem 0;
         }
+        .phone-field {
+            display: flex;
+            align-items: stretch;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            overflow: hidden;
+            background: #fff;
+        }
+        .phone-field:focus-within {
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(37, 211, 102, 0.2);
+        }
+        .phone-prefix {
+            display: flex;
+            align-items: center;
+            padding: 0.75rem 0.85rem;
+            background: #f1f5f9;
+            color: var(--text);
+            font-size: 1rem;
+            font-weight: 600;
+            border-right: 1px solid var(--border);
+            white-space: nowrap;
+        }
+        .phone-field input {
+            flex: 1;
+            border: none;
+            border-radius: 0;
+            box-shadow: none;
+        }
+        .phone-field input:focus {
+            outline: none;
+            box-shadow: none;
+        }
         input:focus, textarea:focus {
             outline: none;
             border-color: var(--primary);
@@ -149,8 +182,11 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
         <form id="whatsappForm" novalidate>
             <div class="form-group">
                 <label for="phone">Phone Number</label>
-                <input type="text" id="phone" name="phone" inputmode="numeric" autocomplete="tel" placeholder="919876543210" required>
-                <p class="hint">Country code + number (e.g. 919876543210). + and spaces are OK.</p>
+                <div class="phone-field">
+                    <span class="phone-prefix" aria-hidden="true">+91</span>
+                    <input type="tel" id="phone" name="phone" inputmode="numeric" autocomplete="tel-national" placeholder="9876543210" maxlength="10" required>
+                </div>
+                <p class="hint">Enter 10-digit mobile only. +91 is added automatically.</p>
             </div>
             <div class="form-group">
                 <label for="message">Message <span style="font-weight:400;color:var(--muted)">(caption if image)</span></label>
@@ -196,14 +232,39 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
             alertBox.textContent = text;
         }
 
+        var phoneInput = document.getElementById('phone');
+
+        phoneInput.addEventListener('input', function () {
+            var digits = String(this.value).replace(/\D/g, '');
+            if (digits.length > 10) {
+                if (digits.indexOf('91') === 0 && digits.length >= 12) {
+                    digits = digits.slice(2, 12);
+                } else {
+                    digits = digits.slice(0, 10);
+                }
+            }
+            if (digits.length === 11 && digits.charAt(0) === '0') {
+                digits = digits.slice(1);
+            }
+            if (this.value !== digits) {
+                this.value = digits;
+            }
+        });
+
         function normalizePhone(raw) {
             var digits = String(raw).replace(/\D/g, '');
             if (!digits) return { ok: false, error: 'Phone number is required.' };
-            if (digits.length < 10 || digits.length > 15) {
-                return { ok: false, error: 'Use country code + number (e.g. 919876543210).' };
+            if (digits.length === 11 && digits.charAt(0) === '0') {
+                digits = digits.slice(1);
             }
-            if (digits.length === 10) digits = '91' + digits;
-            return { ok: true, phone: digits };
+            if (digits.length === 10) {
+                digits = '91' + digits;
+            } else if (digits.length === 12 && digits.indexOf('91') === 0) {
+                // full number pasted with country code
+            } else {
+                return { ok: false, error: 'Enter a valid 10-digit mobile number.' };
+            }
+            return { ok: true, phone: digits, display: '+91 ' + digits.slice(2) };
         }
 
         var TEXT_TIMEOUT_MS = 125000;

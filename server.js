@@ -625,25 +625,37 @@ async function assertWhatsAppConnected() {
   );
 }
 
-function validatePhone(phone) {
-  if (typeof phone !== "string" && typeof phone !== "number") {
-    return { valid: false, message: "Phone must be a string or number" };
-  }
-
-  const digits = String(phone).replace(/\D/g, "");
+function normalizePhoneDigits(raw) {
+  let digits = String(raw).replace(/\D/g, "");
 
   if (!digits) {
     return { valid: false, message: "Phone number is invalid" };
   }
 
-  if (digits.length < 10 || digits.length > 15) {
+  if (digits.length === 11 && digits.startsWith("0")) {
+    digits = digits.slice(1);
+  }
+
+  if (digits.length === 10) {
+    digits = `91${digits}`;
+  } else if (digits.length === 12 && digits.startsWith("91")) {
+    // already includes India country code
+  } else if (digits.length < 10 || digits.length > 15) {
     return {
       valid: false,
-      message: "Phone must include country code (10–15 digits)",
+      message: "Enter 10-digit mobile (e.g. 9876543210) or full number with country code",
     };
   }
 
   return { valid: true, digits };
+}
+
+function validatePhone(phone) {
+  if (typeof phone !== "string" && typeof phone !== "number") {
+    return { valid: false, message: "Phone must be a string or number" };
+  }
+
+  return normalizePhoneDigits(phone);
 }
 
 function validateImageUrl(imageUrl) {
