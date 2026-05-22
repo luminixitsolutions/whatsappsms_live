@@ -11,7 +11,10 @@ const HOST = "0.0.0.0";
 const AUTH_PATH = path.resolve(__dirname, ".wwebjs_auth");
 const CACHE_PATH = path.resolve(__dirname, ".wwebjs_cache");
 const SESSION_PATH = path.join(AUTH_PATH, "session");
-const STALL_RESET_MS = Number(process.env.STALL_RESET_MS) || 120000;
+const STALL_RESET_MS = Number(process.env.STALL_RESET_MS) || 300000;
+const KEEPALIVE_MS = Number(process.env.KEEPALIVE_MS) || 4 * 60 * 1000;
+const CONNECTION_CHECK_MS = Number(process.env.CONNECTION_CHECK_MS) || 3 * 60 * 1000;
+const SESSION_DIR = path.join(AUTH_PATH, "session-default");
 
 function ensureAuthDirectories() {
   fs.mkdirSync(AUTH_PATH, { recursive: true });
@@ -27,6 +30,26 @@ function clearAuthData() {
     }
   }
   ensureAuthDirectories();
+}
+
+function hasPersistedSession() {
+  try {
+    return (
+      fs.existsSync(SESSION_DIR) &&
+      fs.readdirSync(SESSION_DIR).some((name) => !name.startsWith("."))
+    );
+  } catch (error) {
+    return false;
+  }
+}
+
+function shouldClearSessionOnDisconnect(reason) {
+  const reasonStr = String(reason || "").toUpperCase();
+  return (
+    reasonStr.includes("LOGOUT") ||
+    reasonStr === "UNPAIRED" ||
+    reasonStr.includes("UNPAIRED_IDLE")
+  );
 }
 
 function canResetSession(req) {
@@ -68,6 +91,9 @@ let initError = null;
 let clientStartedAt = Date.now();
 let isReconnecting = false;
 let stallWatchdogTimer = null;
+let keepAliveTimer = null;
+let connectionMonitorTimer = null;
+let lastReadyAt = 0;
 let waQueue = Promise.resolve();
 let waCooldownUntil = 0;
 const chatIdCache = new Map();
@@ -189,9 +215,10 @@ client.on("ready", () => {
   clientState = "ready";
   lastQr = null;
   initError = null;
+  lastReadyAt = Date.now();
   clientStartedAt = Date.now();
   chatIdCache.clear();
-  console.log("WhatsApp ready");
+  console.log("WhatsApp ready — session kept at", AUTH_PATH);
 });
 
 client.on("disconnected", async (reason) => {
@@ -203,36 +230,27 @@ client.on("disconnected", async (reason) => {
     return;
   }
 
-  isReconnecting = true;
   console.log("Reconnecting WhatsApp client in 5s...");
 
   setTimeout(async () => {
-    try {
-      await client.destroy();
-    } catch (error) {
-      console.error("Destroy before reconnect:", error.message);
+    if (isReconnecting) {
+      return;
     }
 
-    const reasonStr = String(reason || "").toUpperCase();
-    if (
-      reasonStr.includes("LOGOUT") ||
-      reasonStr.includes("UNPAIRED") ||
-      reasonStr.includes("MAX")
-    ) {
+    if (shouldClearSessionOnDisconnect(reason)) {
       console.log("Clearing session after disconnect:", reason);
       clearAuthData();
+    } else {
+      console.log("Keeping saved session after disconnect:", reason);
     }
 
     try {
-      clientStartedAt = Date.now();
-      await client.initialize();
-      console.log("WhatsApp reconnect started");
+      await reconnectWhatsApp("disconnected_event");
+      console.log("WhatsApp reconnect finished");
     } catch (error) {
       initError = error.message;
       clientState = "init_failed";
       console.error("Reconnect failed:", error.message);
-    } finally {
-      isReconnecting = false;
     }
   }, 5000);
 });
@@ -295,6 +313,76 @@ function getNotReadyMessage() {
   return "WhatsApp not ready. Open /qr or check /status before sending.";
 }
 
+async function reconnectWhatsApp(reason) {
+  if (isReconnecting) {
+    throw new Error("WhatsApp is already reconnecting");
+  }
+
+  isReconnecting = true;
+  isReady = false;
+  clientState = "reconnecting";
+  initError = null;
+  console.log("Soft reconnect (session kept):", reason || "manual");
+
+  try {
+    await client.destroy();
+  } catch (error) {
+    console.warn("Destroy during reconnect:", error.message);
+  }
+
+  clientStartedAt = Date.now();
+
+  try {
+    await client.initialize();
+  } finally {
+    isReconnecting = false;
+  }
+}
+
+async function waitForReady(maxMs = 90000) {
+  const deadline = Date.now() + maxMs;
+  while (Date.now() < deadline) {
+    if (isReady && clientState === "ready") {
+      return true;
+    }
+    if (isReconnecting || clientState === "loading") {
+      await delay(2000);
+      continue;
+    }
+    break;
+  }
+  return isReady && clientState === "ready";
+}
+
+async function ensureClientReadyForSend() {
+  if (isReady && clientState === "ready") {
+    return;
+  }
+
+  if (!hasPersistedSession()) {
+    throw new Error(getNotReadyMessage());
+  }
+
+  if (isReconnecting) {
+    const ok = await waitForReady(60000);
+    if (ok) {
+      return;
+    }
+    throw new Error(
+      "WhatsApp is reconnecting — wait 30 seconds and try again."
+    );
+  }
+
+  console.log("Send requested while not ready — reconnecting with saved session");
+  await reconnectWhatsApp("before_send");
+  const ok = await waitForReady(90000);
+  if (!ok) {
+    throw new Error(
+      "WhatsApp session expired or stuck. Open /qr to scan again (one-time), or /reset-session?confirm=1."
+    );
+  }
+}
+
 async function resetWhatsAppSession(reason) {
   if (isReconnecting) {
     throw new Error("WhatsApp is already resetting — wait a moment.");
@@ -351,16 +439,34 @@ function startStallWatchdog() {
       return;
     }
 
+    if (clientState === "disconnected" || clientState === "not_connected") {
+      if (hasPersistedSession() && !isReconnecting) {
+        console.log("Stall watchdog: reconnecting with saved session");
+        reconnectWhatsApp("stall_watchdog_disconnect").catch((error) => {
+          console.error("Stall watchdog reconnect failed:", error.message);
+        });
+      }
+      return;
+    }
+
     const stalledStates = new Set([
       "initializing",
       "loading",
       "authenticated",
-      "not_connected",
-      "disconnected",
       "init_failed",
     ]);
 
     if (!stalledStates.has(clientState)) {
+      return;
+    }
+
+    if (hasPersistedSession() && lastReadyAt > 0) {
+      console.log(
+        `Stall watchdog: stuck in "${clientState}" but session exists — reconnecting`
+      );
+      reconnectWhatsApp("stall_watchdog_session").catch((error) => {
+        console.error("Stall watchdog reconnect failed:", error.message);
+      });
       return;
     }
 
@@ -372,6 +478,73 @@ function startStallWatchdog() {
       console.error("Stall watchdog reset failed:", error.message);
     });
   }, 30000);
+}
+
+function startKeepAlive() {
+  if (keepAliveTimer) {
+    clearInterval(keepAliveTimer);
+  }
+
+  keepAliveTimer = setInterval(async () => {
+    if (!isReady || clientState !== "ready" || isReconnecting) {
+      return;
+    }
+
+    try {
+      const state = await withTimeout(
+        client.getState(),
+        20000,
+        "keepalive getState"
+      );
+      if (state !== "CONNECTED") {
+        console.warn("Keep-alive: state is", state, "— reconnecting");
+        await reconnectWhatsApp("keepalive_not_connected");
+      }
+    } catch (error) {
+      console.warn("Keep-alive failed:", error.message, "— reconnecting");
+      try {
+        await reconnectWhatsApp("keepalive_failed");
+      } catch (reconnectError) {
+        console.error("Keep-alive reconnect failed:", reconnectError.message);
+      }
+    }
+  }, KEEPALIVE_MS);
+}
+
+function startConnectionMonitor() {
+  if (connectionMonitorTimer) {
+    clearInterval(connectionMonitorTimer);
+  }
+
+  connectionMonitorTimer = setInterval(async () => {
+    if (isReconnecting || lastQr) {
+      return;
+    }
+
+    if (isReady && clientState === "ready") {
+      return;
+    }
+
+    if (!hasPersistedSession()) {
+      return;
+    }
+
+    const offlineStates = new Set([
+      "disconnected",
+      "not_connected",
+      "init_failed",
+      "reconnecting",
+    ]);
+
+    if (offlineStates.has(clientState)) {
+      console.log("Connection monitor: recovering", clientState);
+      try {
+        await reconnectWhatsApp("connection_monitor");
+      } catch (error) {
+        console.error("Connection monitor failed:", error.message);
+      }
+    }
+  }, CONNECTION_CHECK_MS);
 }
 
 function renderQrWaitingPage() {
@@ -532,7 +705,19 @@ app.get("/", (req, res) => {
       sendMessagePost:
         'POST /send-message {phone, message, image | imageBase64, imageMime}',
       health: "GET /health",
+      wake: "GET /wake (ping every 10 min to avoid Railway sleep)",
     },
+    sessionPersisted: hasPersistedSession(),
+    sessionPath: AUTH_PATH,
+  });
+});
+
+app.get("/wake", (req, res) => {
+  res.json({
+    ok: true,
+    uptime: process.uptime(),
+    whatsapp: isReady && clientState === "ready" ? "ready" : clientState,
+    sessionPersisted: hasPersistedSession(),
   });
 });
 
@@ -638,6 +823,8 @@ app.get("/status", async (req, res) => {
     waState: waState || "unknown",
     hasQr: Boolean(lastQr),
     initError: initError || null,
+    sessionPersisted: hasPersistedSession(),
+    lastReadyAt: lastReadyAt || null,
     waitingSeconds: Math.floor((Date.now() - clientStartedAt) / 1000),
   });
 });
@@ -732,7 +919,7 @@ async function buildMessageMedia(imageOptions) {
 }
 
 async function handleSendMessage(phone, message, imageSource, res) {
-  if (!isReady || clientState !== "ready") {
+  if ((!isReady || clientState !== "ready") && !hasPersistedSession()) {
     return res.status(503).json({
       status: false,
       message: getNotReadyMessage(),
@@ -771,18 +958,11 @@ async function handleSendMessage(phone, message, imageSource, res) {
     });
   }
 
-  const sendTimeoutMs = hasImage ? 90000 : 60000;
-  const queueTimeoutMs = hasImage ? 120000 : 75000;
+  const sendTimeoutMs = hasImage ? 120000 : 90000;
+  const queueTimeoutMs = hasImage ? 150000 : 120000;
 
   return enqueueWaTask(async () => {
-    if (!isReady || clientState !== "ready") {
-      return res.status(503).json({
-        status: false,
-        message: "WhatsApp not ready. Scan QR at /qr",
-        clientState,
-      });
-    }
-
+    await ensureClientReadyForSend();
     await assertWhatsAppConnected();
 
     const chatId = await resolveChatId(phoneCheck.digits);
@@ -816,8 +996,12 @@ async function handleSendMessage(phone, message, imageSource, res) {
     } catch (error) {
       if (String(error.message || "").includes("timed out")) {
         isReady = false;
+        clientState = "disconnected";
         chatIdCache.delete(phoneCheck.digits);
-        console.error("Send timed out — marking client not ready");
+        console.error("Send timed out — reconnecting with saved session");
+        reconnectWhatsApp("send_timeout").catch((reconnectError) => {
+          console.error("Reconnect after send timeout:", reconnectError.message);
+        });
       }
       throw error;
     }
@@ -910,6 +1094,15 @@ async function startWhatsAppClient() {
 
     await delay(3000);
 
+    if (hasPersistedSession()) {
+      try {
+        await reconnectWhatsApp("init_failed_retry");
+        return;
+      } catch (reconnectError) {
+        console.error("Reconnect after init failed:", reconnectError.message);
+      }
+    }
+
     try {
       await resetWhatsAppSession("init_failed");
     } catch (resetError) {
@@ -926,6 +1119,8 @@ async function startServer() {
   });
 
   startStallWatchdog();
+  startKeepAlive();
+  startConnectionMonitor();
   startWhatsAppClient();
 
   const shutdown = async (signal) => {
