@@ -9,7 +9,9 @@ const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = "0.0.0.0";
 const AUTH_PATH = path.resolve(__dirname, ".wwebjs_auth");
+const CACHE_PATH = path.resolve(__dirname, ".wwebjs_cache");
 const SESSION_PATH = path.join(AUTH_PATH, "session");
+const STALL_RESET_MS = Number(process.env.STALL_RESET_MS) || 120000;
 
 function ensureAuthDirectories() {
   fs.mkdirSync(AUTH_PATH, { recursive: true });
@@ -17,6 +19,26 @@ function ensureAuthDirectories() {
 }
 
 ensureAuthDirectories();
+
+function clearAuthData() {
+  for (const dir of [AUTH_PATH, CACHE_PATH]) {
+    if (fs.existsSync(dir)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  ensureAuthDirectories();
+}
+
+function canResetSession(req) {
+  const secret = process.env.RESET_SECRET;
+  if (!secret) {
+    return true;
+  }
+
+  const provided =
+    req.query?.secret || req.body?.secret || req.get("x-reset-secret");
+  return provided === secret;
+}
 
 const app = express();
 
@@ -41,7 +63,11 @@ app.use(express.json({ limit: "12mb" }));
 let isReady = false;
 let clientState = "initializing";
 let lastQr = null;
+let lastQrAt = 0;
+let initError = null;
+let clientStartedAt = Date.now();
 let isReconnecting = false;
+let stallWatchdogTimer = null;
 let waQueue = Promise.resolve();
 let waCooldownUntil = 0;
 const chatIdCache = new Map();
@@ -137,6 +163,8 @@ async function resolveChatId(digits) {
 
 client.on("qr", (qr) => {
   lastQr = qr;
+  lastQrAt = Date.now();
+  initError = null;
   clientState = "qr_pending";
   isReady = false;
   console.log("QR received — scan with WhatsApp (Linked Devices):");
@@ -152,6 +180,7 @@ client.on("authenticated", () => {
 client.on("auth_failure", (message) => {
   clientState = "auth_failure";
   isReady = false;
+  initError = String(message || "Authentication failed");
   console.error("Authentication failed:", message);
 });
 
@@ -159,6 +188,8 @@ client.on("ready", () => {
   isReady = true;
   clientState = "ready";
   lastQr = null;
+  initError = null;
+  clientStartedAt = Date.now();
   chatIdCache.clear();
   console.log("WhatsApp ready");
 });
@@ -182,10 +213,23 @@ client.on("disconnected", async (reason) => {
       console.error("Destroy before reconnect:", error.message);
     }
 
+    const reasonStr = String(reason || "").toUpperCase();
+    if (
+      reasonStr.includes("LOGOUT") ||
+      reasonStr.includes("UNPAIRED") ||
+      reasonStr.includes("MAX")
+    ) {
+      console.log("Clearing session after disconnect:", reason);
+      clearAuthData();
+    }
+
     try {
+      clientStartedAt = Date.now();
       await client.initialize();
       console.log("WhatsApp reconnect started");
     } catch (error) {
+      initError = error.message;
+      clientState = "init_failed";
       console.error("Reconnect failed:", error.message);
     } finally {
       isReconnecting = false;
@@ -210,6 +254,123 @@ async function getWaConnectionState() {
     console.warn("getState failed:", error.message);
     return null;
   }
+}
+
+async function resetWhatsAppSession(reason) {
+  if (isReconnecting) {
+    throw new Error("WhatsApp is already resetting — wait a moment.");
+  }
+
+  isReconnecting = true;
+  isReady = false;
+  lastQr = null;
+  lastQrAt = 0;
+  clientState = "resetting";
+  initError = null;
+  chatIdCache.clear();
+
+  console.log("Resetting WhatsApp session:", reason || "manual");
+
+  try {
+    await client.destroy();
+  } catch (error) {
+    console.warn("Destroy during reset:", error.message);
+  }
+
+  clearAuthData();
+  clientStartedAt = Date.now();
+  clientState = "initializing";
+
+  try {
+    await client.initialize();
+    console.log("WhatsApp re-initialized after session reset");
+    return {
+      status: true,
+      message: "Session cleared. Open /qr and scan when the QR appears.",
+      clientState,
+    };
+  } catch (error) {
+    initError = error.message;
+    clientState = "init_failed";
+    throw error;
+  } finally {
+    isReconnecting = false;
+  }
+}
+
+function startStallWatchdog() {
+  if (stallWatchdogTimer) {
+    clearInterval(stallWatchdogTimer);
+  }
+
+  stallWatchdogTimer = setInterval(() => {
+    if (isReady || lastQr || isReconnecting) {
+      return;
+    }
+
+    if (Date.now() - clientStartedAt < STALL_RESET_MS) {
+      return;
+    }
+
+    const stalledStates = new Set([
+      "initializing",
+      "loading",
+      "authenticated",
+      "not_connected",
+      "disconnected",
+      "init_failed",
+    ]);
+
+    if (!stalledStates.has(clientState)) {
+      return;
+    }
+
+    console.log(
+      `No QR for ${STALL_RESET_MS}ms in state "${clientState}" — auto-resetting session`
+    );
+
+    resetWhatsAppSession("stall_watchdog").catch((error) => {
+      console.error("Stall watchdog reset failed:", error.message);
+    });
+  }, 30000);
+}
+
+function renderQrWaitingPage() {
+  const uptimeSec = Math.floor(process.uptime());
+  const waitingSec = Math.floor((Date.now() - clientStartedAt) / 1000);
+  const detail = initError
+    ? `<p style="color:#b91c1c">Error: ${escapeHtml(initError)}</p>`
+    : "";
+  const resetHint =
+    waitingSec >= 60
+      ? `<p><a href="/reset-session?confirm=1" style="color:#1d4ed8">Reset session and show new QR</a></p>`
+      : `<p><small>If no QR after 2 minutes, <a href="/reset-session?confirm=1">reset session</a>.</small></p>`;
+
+  return (
+    "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"3\">" +
+    "<title>Waiting for QR</title></head>" +
+    "<body style=\"font-family:sans-serif;text-align:center;padding:2rem;max-width:520px;margin:0 auto\">" +
+    "<h2>Waiting for QR code...</h2>" +
+    "<p>State: <strong>" +
+    escapeHtml(clientState) +
+    "</strong> · waiting " +
+    waitingSec +
+    "s · uptime " +
+    uptimeSec +
+    "s</p>" +
+    detail +
+    resetHint +
+    "<p>Page refreshes every 3 seconds.</p>" +
+    "<p><a href=\"/status\">API status (JSON)</a></p></body></html>"
+  );
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 async function assertWhatsAppConnected() {
@@ -303,6 +464,7 @@ app.get("/", (req, res) => {
     whatsapp: isReady ? "ready" : "not_ready",
     endpoints: {
       qr: "GET /qr",
+      resetSession: "GET /reset-session?confirm=1",
       status: "GET /status",
       sendMessageGet:
         "GET /send-message?phone=919876543210&message=Hello&image=https://example.com/pic.jpg",
@@ -323,12 +485,7 @@ app.get("/qr", async (req, res) => {
   }
 
   if (!lastQr) {
-    return res.send(
-      "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"3\">" +
-        "<title>Waiting for QR</title></head>" +
-        "<body style=\"font-family:sans-serif;text-align:center;padding:2rem\">" +
-        "<h2>Waiting for QR code...</h2><p>Page refreshes every 3 seconds.</p></body></html>"
-    );
+    return res.send(renderQrWaitingPage());
   }
 
   try {
@@ -348,6 +505,67 @@ app.get("/qr", async (req, res) => {
   }
 });
 
+app.get("/reset-session", async (req, res) => {
+  if (req.query.confirm !== "1") {
+    return res.status(400).json({
+      status: false,
+      message: "Add ?confirm=1 to reset the WhatsApp session and force a new QR.",
+    });
+  }
+
+  if (!canResetSession(req)) {
+    return res.status(403).json({
+      status: false,
+      message: "Invalid or missing RESET_SECRET.",
+    });
+  }
+
+  try {
+    const result = await resetWhatsAppSession("api_get");
+    if (req.accepts("html") && req.query.json !== "1") {
+      return res.redirect("/qr");
+    }
+    return res.json(result);
+  } catch (error) {
+    if (req.accepts("html") && req.query.json !== "1") {
+      return res
+        .status(500)
+        .send(
+          "<!DOCTYPE html><html><body style=\"font-family:sans-serif;padding:2rem\">" +
+            "<h2>Reset failed</h2><p>" +
+            escapeHtml(error.message || "Failed to reset session") +
+            "</p><p><a href=\"/qr\">Back to QR</a></p></body></html>"
+        );
+    }
+
+    return res.status(500).json({
+      status: false,
+      message: error.message || "Failed to reset session",
+      clientState,
+    });
+  }
+});
+
+app.post("/reset-session", async (req, res) => {
+  if (!canResetSession(req)) {
+    return res.status(403).json({
+      status: false,
+      message: "Invalid or missing RESET_SECRET.",
+    });
+  }
+
+  try {
+    const result = await resetWhatsAppSession("api_post");
+    return res.json(result);
+  } catch (error) {
+    return res.status(500).json({
+      status: false,
+      message: error.message || "Failed to reset session",
+      clientState,
+    });
+  }
+});
+
 app.get("/status", async (req, res) => {
   const waState = await getWaConnectionState();
   const ready =
@@ -357,6 +575,9 @@ app.get("/status", async (req, res) => {
     status: ready ? "ready" : "not_ready",
     clientState,
     waState: waState || "unknown",
+    hasQr: Boolean(lastQr),
+    initError: initError || null,
+    waitingSeconds: Math.floor((Date.now() - clientStartedAt) / 1000),
   });
 });
 
@@ -616,6 +837,30 @@ app.use((err, req, res, next) => {
   });
 });
 
+async function startWhatsAppClient() {
+  clientStartedAt = Date.now();
+  clientState = "initializing";
+  initError = null;
+
+  try {
+    await client.initialize();
+    console.log("WhatsApp client initialize() finished");
+  } catch (error) {
+    initError = error.message;
+    clientState = "init_failed";
+    console.error("Failed to initialize WhatsApp client:", error.message);
+    console.log("Retrying with a clean session in 3s...");
+
+    await delay(3000);
+
+    try {
+      await resetWhatsAppSession("init_failed");
+    } catch (resetError) {
+      console.error("Recovery reset failed:", resetError.message);
+    }
+  }
+}
+
 async function startServer() {
   ensureAuthDirectories();
 
@@ -623,12 +868,8 @@ async function startServer() {
     console.log(`WhatsApp API running on http://${HOST}:${PORT}`);
   });
 
-  try {
-    await client.initialize();
-  } catch (error) {
-    console.error("Failed to initialize WhatsApp client:", error.message);
-    process.exit(1);
-  }
+  startStallWatchdog();
+  startWhatsAppClient();
 
   const shutdown = async (signal) => {
     console.log(`${signal} received — shutting down`);
