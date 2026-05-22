@@ -183,6 +183,8 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
     <script>
     (function () {
         var API_URL = <?php echo json_encode(WHATSAPP_API_URL, JSON_UNESCAPED_SLASHES); ?>;
+        var API_BASE = <?php echo json_encode(WHATSAPP_API_BASE, JSON_UNESCAPED_SLASHES); ?>;
+        var QR_URL = API_BASE + '/qr';
         var form = document.getElementById('whatsappForm');
         var btn = document.getElementById('submitBtn');
         var alertBox = document.getElementById('alertBox');
@@ -326,6 +328,40 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
             }, timeoutMs).then(parseApiResponse);
         }
 
+        function checkApiStatus() {
+            return fetchWithTimeout(API_BASE + '/status', { method: 'GET', mode: 'cors' }, 25000)
+                .then(parseApiResponse)
+                .then(function (result) {
+                    if (!result || !result.data) {
+                        return { ok: false, error: 'Cannot reach WhatsApp API. Check Railway is running.' };
+                    }
+                    var data = result.data;
+                    if (data.status === 'ready') {
+                        return { ok: true };
+                    }
+                    if (data.hasQr || data.clientState === 'qr_pending' || data.waState === 'UNPAIRED') {
+                        return {
+                            ok: false,
+                            error: 'WhatsApp is not linked. Open QR login, scan with your phone, wait until status is ready, then send.',
+                            qr: true
+                        };
+                    }
+                    if (data.clientState === 'loading' || data.clientState === 'authenticated') {
+                        return {
+                            ok: false,
+                            error: 'WhatsApp is still connecting on Railway — wait 30 seconds and try again.'
+                        };
+                    }
+                    return {
+                        ok: false,
+                        error: 'WhatsApp API is not ready (' + (data.clientState || 'unknown') + '). Check status link below.'
+                    };
+                })
+                .catch(function () {
+                    return { ok: false, error: 'Cannot reach WhatsApp API. Check Railway deployment.' };
+                });
+        }
+
         form.addEventListener('submit', function (e) {
             e.preventDefault();
 
@@ -366,32 +402,47 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
                 }
             }
 
-            lastSubmitAt = now;
-            var hasImage = Boolean(imageRaw || hasFile);
-            var timeoutMs = hasImage ? IMAGE_TIMEOUT_MS : TEXT_TIMEOUT_MS;
-
             btn.disabled = true;
             btn.classList.add('is-loading');
-            btnText.textContent = hasImage ? 'Sending image...' : 'Sending...';
+            btnText.textContent = 'Checking WhatsApp...';
             alertBox.style.display = 'none';
 
-            var safetyTimer = setTimeout(function () {
-                resetButton();
-                showAlert('error', 'Request timed out. Wait 5 seconds, then try again.');
-            }, timeoutMs + 2000);
+            checkApiStatus().then(function (statusCheck) {
+                if (!statusCheck.ok) {
+                    resetButton();
+                    var msg = statusCheck.error;
+                    if (statusCheck.qr) {
+                        msg += ' QR: ' + QR_URL;
+                    }
+                    showAlert('error', msg);
+                    return;
+                }
 
-            var sendPromise;
-            if (hasFile) {
-                sendPromise = readImageFile(selectedFile).then(function (fileData) {
-                    return sendPost(phoneCheck.phone, messageRaw, null, fileData, timeoutMs);
-                });
-            } else if (imageRaw) {
-                sendPromise = sendPost(phoneCheck.phone, messageRaw, imageRaw, null, timeoutMs);
-            } else {
-                sendPromise = sendGet(phoneCheck.phone, messageRaw, null, timeoutMs);
-            }
+                lastSubmitAt = Date.now();
+                var hasImage = Boolean(imageRaw || hasFile);
+                var timeoutMs = hasImage ? IMAGE_TIMEOUT_MS : TEXT_TIMEOUT_MS;
 
-            sendPromise
+                btn.disabled = true;
+                btn.classList.add('is-loading');
+                btnText.textContent = hasImage ? 'Sending image...' : 'Sending...';
+
+                var safetyTimer = setTimeout(function () {
+                    resetButton();
+                    showAlert('error', 'Request timed out. Wait 5 seconds, then try again.');
+                }, timeoutMs + 2000);
+
+                var sendPromise;
+                if (hasFile) {
+                    sendPromise = readImageFile(selectedFile).then(function (fileData) {
+                        return sendPost(phoneCheck.phone, messageRaw, null, fileData, timeoutMs);
+                    });
+                } else if (imageRaw) {
+                    sendPromise = sendPost(phoneCheck.phone, messageRaw, imageRaw, null, timeoutMs);
+                } else {
+                    sendPromise = sendGet(phoneCheck.phone, messageRaw, null, timeoutMs);
+                }
+
+                return sendPromise
                 .then(function (result) {
                     if (!result) {
                         showAlert('error', 'Cannot reach Railway API. Check status link below.');
@@ -420,6 +471,7 @@ define('WHATSAPP_API_URL', WHATSAPP_API_BASE . '/send-message');
                     clearTimeout(safetyTimer);
                     resetButton();
                 });
+            });
         });
     })();
     </script>

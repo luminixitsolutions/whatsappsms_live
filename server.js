@@ -244,16 +244,55 @@ client.on("loading_screen", (percent, message) => {
 });
 
 async function getWaConnectionState() {
-  try {
-    return await withTimeout(
-      client.getState(),
-      8000,
-      "Could not read WhatsApp connection state"
-    );
-  } catch (error) {
-    console.warn("getState failed:", error.message);
-    return null;
+  const attempts = 3;
+  const timeoutMs = 20000;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await withTimeout(
+        client.getState(),
+        timeoutMs,
+        "Could not read WhatsApp connection state"
+      );
+    } catch (error) {
+      console.warn(
+        `getState attempt ${attempt}/${attempts} failed:`,
+        error.message
+      );
+      if (attempt < attempts) {
+        await delay(1500);
+      }
+    }
   }
+
+  return null;
+}
+
+function getNotReadyMessage() {
+  if (clientState === "qr_pending" || lastQr) {
+    return "WhatsApp is not linked. Open /qr, scan the QR code, wait until status shows ready, then send.";
+  }
+
+  if (clientState === "loading" || clientState === "authenticated") {
+    return "WhatsApp is still connecting — wait until /status shows ready, then try again.";
+  }
+
+  if (clientState === "auth_failure") {
+    return (
+      initError ||
+      "Authentication failed. Open /reset-session?confirm=1 then scan QR at /qr."
+    );
+  }
+
+  if (
+    clientState === "disconnected" ||
+    clientState === "not_connected" ||
+    clientState.startsWith("wa_")
+  ) {
+    return "WhatsApp disconnected. Open /qr to link again, or /reset-session?confirm=1 if stuck.";
+  }
+
+  return "WhatsApp not ready. Open /qr or check /status before sending.";
 }
 
 async function resetWhatsAppSession(reason) {
@@ -374,20 +413,42 @@ function escapeHtml(value) {
 }
 
 async function assertWhatsAppConnected() {
+  if (!isReady || clientState !== "ready") {
+    throw new Error(getNotReadyMessage());
+  }
+
   const state = await getWaConnectionState();
+
   if (state === "CONNECTED") {
     return;
   }
 
+  if (state === null) {
+    console.warn("getState unavailable — proceeding because client emitted ready");
+    return;
+  }
+
+  const needsQr = new Set([
+    "UNPAIRED",
+    "UNPAIRED_IDLE",
+    "PAIRING",
+    "TIMEOUT",
+    "TOS_BLOCK",
+    "SMB_TOS_BLOCK",
+    "PROXYBLOCK",
+  ]);
+
   isReady = false;
-  if (clientState === "ready") {
-    clientState = state ? `wa_${String(state).toLowerCase()}` : "not_connected";
+  clientState = `wa_${String(state).toLowerCase()}`;
+
+  if (needsQr.has(state)) {
+    throw new Error(
+      "WhatsApp is not linked. Open /qr, scan the QR code, wait for ready status, then send."
+    );
   }
 
   throw new Error(
-    state === null
-      ? "WhatsApp is busy or reconnecting — wait a few seconds and try again."
-      : `WhatsApp is not connected (${state}). Open /qr if you need to link again.`
+    `WhatsApp is not ready (${state}). Wait a moment or open /qr to link again.`
   );
 }
 
@@ -672,15 +733,11 @@ async function buildMessageMedia(imageOptions) {
 
 async function handleSendMessage(phone, message, imageSource, res) {
   if (!isReady || clientState !== "ready") {
-    const busyMessage =
-      clientState === "loading"
-        ? "WhatsApp is loading or reconnecting — wait until status is ready, then try again."
-        : "WhatsApp not ready. Scan QR first or wait for session restore.";
-
     return res.status(503).json({
       status: false,
-      message: busyMessage,
+      message: getNotReadyMessage(),
       clientState,
+      needsQr: Boolean(lastQr) || clientState === "qr_pending",
     });
   }
 
